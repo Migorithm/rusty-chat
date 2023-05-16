@@ -4,7 +4,7 @@ use async_std::{
     prelude::*, //1
     task,       //2 task module roughly corresponds to the std::thread module,
 };
-use futures::{channel::mpsc, SinkExt};
+use futures::{channel::mpsc, select, FutureExt, SinkExt};
 use std::{
     collections::{hash_map::Entry, HashMap},
     sync::Arc,
@@ -14,6 +14,9 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 // Sending messages
 type Sender<T> = mpsc::UnboundedSender<T>; // Don't care about backpressure for now
 type Receiver<T> = mpsc::UnboundedReceiver<T>;
+
+#[derive(Debug)]
+pub enum Void {}
 
 fn run() -> Result<()> {
     //! Here, accept_loop is root function listening on 127.0.0.1:8080
@@ -27,40 +30,20 @@ fn run() -> Result<()> {
     task::block_on(fut)
 }
 
-fn spawn_and_log_error<F>(fut: F) -> task::JoinHandle<()>
-where
-    F: Future<Output = Result<()>> + Send + 'static,
-{
-    /*
-    * Could have been the following
-    ! let handle = task::spawn(connection_loop(stream));
-    ! handle.await?
-    * But .await waits until the client finishes nullifying the meaning of async
-    * Plus, it a client encounters an IOError, the whole server will exit, meaning that
-    * One user can bring down the whole chat service.
-     */
-
-    task::spawn(async move {
-        if let Err(e) = fut.await {
-            eprintln!("{}", e)
-        }
-    })
-}
-
 async fn accept_loop(addr: impl ToSocketAddrs) -> Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+    let listener: TcpListener = TcpListener::bind(addr).await?;
 
     // Create channel
-    let (broker_sender, broker_receiver) = mpsc::unbounded();
+    let (sender_to_broker, receiving_end_on_broker) = mpsc::unbounded();
 
-    // * 'receiving end' is sent to 'broker_loop' which is dispatcher the controls receiver.
+    // * 'receiving end' is sent to 'broker_loop' which is dispatcher that controls receiver.
     // * This receiver actor can make local decisions, such as maintaining local state,
     // * creating more Actors, sending more messages, designating how to respond to the next message.
 
     // ? Why only 'receiving end'?
     // * That's because all the senders will be sent to connection_loop
     // * within which the sender will send Event which is either NewPeer or Message
-    let broker = task::spawn(broker_loop(broker_receiver));
+    let _call_to_broker = task::spawn(broker_loop(receiving_end_on_broker));
 
     let mut incoming = listener.incoming();
 
@@ -84,12 +67,14 @@ async fn accept_loop(addr: impl ToSocketAddrs) -> Result<()> {
          * Correct way to handle client errors in this case is log them and continue serving
          * other client so helper function `spawn_and_log_error` is introduced.
          */
-        spawn_and_log_error(connection_loop(broker_sender.clone(), stream));
+        spawn_and_log_error(connection_loop(sender_to_broker.clone(), stream));
     }
+    drop(sender_to_broker);
+    _call_to_broker.await?;
     Ok(())
 }
 
-async fn connection_loop(mut broker: Sender<Event>, stream: TcpStream) -> Result<()> {
+async fn connection_loop(mut sender_to_broker: Sender<Event>, stream: TcpStream) -> Result<()> {
     // * Inside connection_loop,
     // * we need to wrap TcpStream into an Arc,
     // * to be able to share it with the connection_writer_loop
@@ -102,13 +87,17 @@ async fn connection_loop(mut broker: Sender<Event>, stream: TcpStream) -> Result
         Some(line) => line?,
     };
 
+    // * In the reader, we create a shutdown sender whose only purpose is to get dropped
+    let (_shutdown_sender, shutdown_receiver) = mpsc::unbounded::<Void>();
+
     // * On Login, we notify the broker.
     // * Note that we used unwrap() because broker should outlive all the clients and if it doesn't, we have to raise panic.
     // * Send NewPeer doesn't necessarily mean that it will be newly registered as there is checking logic in broker_loop
-    broker
+    sender_to_broker
         .send(Event::NewPeer {
             name: name.clone(),
             stream: Arc::clone(&stream),
+            shutdown: shutdown_receiver,
         })
         .await
         .unwrap();
@@ -128,7 +117,7 @@ async fn connection_loop(mut broker: Sender<Event>, stream: TcpStream) -> Result
         let msg = msg.to_string();
 
         // * Forward parsed messages to the broker, in case it passed parsing logic above
-        broker
+        sender_to_broker
             .send(Event::Message {
                 from: name.clone(),
                 to: dest,
@@ -142,13 +131,32 @@ async fn connection_loop(mut broker: Sender<Event>, stream: TcpStream) -> Result
 }
 
 async fn connection_writer_loop(
-    mut messages: Receiver<String>,
+    mut messages: &mut Receiver<String>,
     stream: Arc<TcpStream>,
+    shutdown: Receiver<Void>,
 ) -> Result<()> {
     let mut stream = &*stream;
-    while let Some(msg) = messages.next().await {
-        stream.write_all(msg.as_bytes()).await?;
+
+    // * fuse - creates a stream that ends after the first None
+    let mut messages = messages.fuse();
+    let mut shutdown = shutdown.fuse();
+
+    loop {
+        // * futures::select
+        select! {
+            // * Function fuse() is used to turn any Stream into a FusedStream
+            // * This is used for fusing a stream such that poll_next will never again be called once it has finished.
+            msg = messages.next().fuse() => match msg{
+                Some(msg) => stream.write_all(msg.as_bytes()).await?,
+                None => break
+            },
+            void = shutdown.next().fuse() => match void{
+                Some(void)=>match void{}, // In the shutdown case we use match void {} as a statically-checked unreachable!().
+                None => break,
+            }
+        }
     }
+
     Ok(())
 }
 
@@ -158,14 +166,15 @@ async fn connection_writer_loop(
 * allows a client to find destination channels
 *
 
- */
+*/
 
 // Broker task should handle two types: a message and arrival of a new peer
 #[derive(Debug)]
-enum Event {
+pub enum Event {
     NewPeer {
         name: String,
         stream: Arc<TcpStream>,
+        shutdown: Receiver<Void>, // pass shutdown channel to the writer task
     },
     Message {
         from: String,
@@ -175,13 +184,37 @@ enum Event {
 }
 
 async fn broker_loop(mut events: Receiver<Event>) -> Result<()> {
+    let (disconnect_sender, mut disconnect_receiver) =
+        mpsc::unbounded::<(String, Receiver<String>)>();
+
     // * An actor holds its own private state and it can decide how to process the next message
     // * based on that state. Internal state changes only after it receives message.
     // * Every actor has its mailbox which is simmilar to message queue
     // * Conceptually, an actor can handle one message at a time
     let mut peers: HashMap<String, Sender<String>> = HashMap::new();
 
-    while let Some(event) = events.next().await {
+    // ? How do we handle disconnections?
+    // ? Simply deleting user from peers map would be wrong. because..
+    // * If both read and write fail, we'll remove the peer twice,
+    // * but it can be the case that the peer reconnected between the two failures!
+    // ! To fix this, we will only remove the peer when the write side finishes.
+    // ! we need to add an ability to signal shutdown for the writer task.
+    // * 1. shutdown: Receiver<()> channel.
+    // * 2. just drop the sender
+
+    let mut events = events.fuse();
+    loop {
+        let event = select! {
+            event = events.next().fuse() => match event{
+                None=>break,
+                Some(event) => event
+            },
+            disconnect = disconnect_receiver.next().fuse() => {
+                let (name, _pending_messages) = disconnect.unwrap();
+                assert!(peers.remove(&name).is_some());
+                continue
+            },
+        };
         match event {
             Event::Message { from, to, msg } => {
                 for addr in to {
@@ -191,23 +224,62 @@ async fn broker_loop(mut events: Receiver<Event>) -> Result<()> {
                     }
                 }
             }
-            Event::NewPeer { name, stream } => {
-                match peers.entry(name) {
+            Event::NewPeer {
+                name,
+                stream,
+                shutdown,
+            } => {
+                match peers.entry(name.clone()) {
                     Entry::Occupied(..) => (),
                     Entry::Vacant(entry) => {
                         // To handler a new peer, we first register it in the peer's map
-                        let (client_sender, client_receiver) = mpsc::unbounded();
+                        let (client_sender, mut client_receiver) = mpsc::unbounded();
                         entry.insert(client_sender);
 
-                        // ! And then  spawn a dedicated task(another actor) to actually write the messages to the socekt
-                        spawn_and_log_error(connection_writer_loop(client_receiver, stream));
+                        // !
+                        let mut disconnect_sender = disconnect_sender.clone();
+                        spawn_and_log_error(async move {
+                            let res =
+                                connection_writer_loop(&mut client_receiver, stream, shutdown)
+                                    .await;
+                            disconnect_sender
+                                .send((name, client_receiver))
+                                .await
+                                .unwrap(); // 4
+                            res
+                        });
                     }
                 }
             }
         }
     }
 
+    drop(peers);
+    drop(disconnect_sender);
+
+    while let Some((_name, _pending_messages)) = disconnect_receiver.next().await {}
+
     Ok(())
+}
+
+fn spawn_and_log_error<F>(fut: F) -> task::JoinHandle<()>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    /*
+    * Could have been the following
+    ! let handle = task::spawn(connection_loop(stream));
+    ! handle.await?
+    * But .await waits until the client finishes nullifying the meaning of async
+    * Plus, it a client encounters an IOError, the whole server will exit, meaning that
+    * One user can bring down the whole chat service.
+     */
+
+    task::spawn(async move {
+        if let Err(e) = fut.await {
+            eprintln!("{}", e)
+        }
+    })
 }
 
 fn main() {}
