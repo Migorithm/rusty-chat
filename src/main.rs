@@ -133,25 +133,24 @@ async fn connection_loop(mut sender_to_broker: Sender<Event>, stream: TcpStream)
 async fn connection_writer_loop(
     mut messages: &mut Receiver<String>,
     stream: Arc<TcpStream>,
-    shutdown: Receiver<Void>,
+    mut shutdown: Receiver<Void>,
 ) -> Result<()> {
     let mut stream = &*stream;
 
-    // * fuse - creates a stream that ends after the first None
-    let mut messages = messages.fuse();
-    let mut shutdown = shutdown.fuse();
-
     loop {
         // * futures::select
+        // * https://docs.rs/futures/latest/futures/macro.select.html
         select! {
             // * Function fuse() is used to turn any Stream into a FusedStream
+            // * fuse() creates a stream that ends after the first None
             // * This is used for fusing a stream such that poll_next will never again be called once it has finished.
             msg = messages.next().fuse() => match msg{
                 Some(msg) => stream.write_all(msg.as_bytes()).await?,
                 None => break
             },
             void = shutdown.next().fuse() => match void{
-                Some(void)=>match void{}, // In the shutdown case we use match void {} as a statically-checked unreachable!().
+                Some(void)=>match void{}, // ! in writer side, we decide not to process message if shutdown message comes first.
+                                          // ! select! polls multiple futures and streams simultaneously, executing the branch for the future that finishes first.
                 None => break,
             }
         }
@@ -204,9 +203,11 @@ async fn broker_loop(mut events: Receiver<Event>) -> Result<()> {
 
     let mut events = events.fuse();
     loop {
+        // ! we are not sure which event comes first.
+        // ! so.. select! is used which polls multiple futures and streams simultaneously, executing the branch for the future that finishes first.
         let event = select! {
             event = events.next().fuse() => match event{
-                None=>break,
+                None=>break, // * Exit when all readers exit
                 Some(event) => event
             },
             disconnect = disconnect_receiver.next().fuse() => {
@@ -215,6 +216,7 @@ async fn broker_loop(mut events: Receiver<Event>) -> Result<()> {
                 continue
             },
         };
+
         match event {
             Event::Message { from, to, msg } => {
                 for addr in to {
@@ -236,16 +238,16 @@ async fn broker_loop(mut events: Receiver<Event>) -> Result<()> {
                         let (client_sender, mut client_receiver) = mpsc::unbounded();
                         entry.insert(client_sender);
 
-                        // !
                         let mut disconnect_sender = disconnect_sender.clone();
                         spawn_and_log_error(async move {
                             let res =
                                 connection_writer_loop(&mut client_receiver, stream, shutdown)
                                     .await;
+
                             disconnect_sender
                                 .send((name, client_receiver))
                                 .await
-                                .unwrap(); // 4
+                                .unwrap(); // * we can safely unwrap because this sender outlives receiver in connection_writer_loop
                             res
                         });
                     }
@@ -255,7 +257,7 @@ async fn broker_loop(mut events: Receiver<Event>) -> Result<()> {
     }
 
     drop(peers);
-    drop(disconnect_sender);
+    drop(disconnect_sender); //* Finally, we close and drain the disconnections channel which isn't fully drained  in the main loop as broker itself holds them.
 
     while let Some((_name, _pending_messages)) = disconnect_receiver.next().await {}
 
